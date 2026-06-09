@@ -1,10 +1,10 @@
 {
 	"Name": "Jixie.SpeedTracker",
-	"Description": "Marks changes in speed on the pilot's HUD.",
+	"Description": "Speedometer and speed-change tracker on the pilot's HUD.",
 	"LoadPriority": 1,
 	"RequiredOnClient": false,
-	"Version": "1.0.0",
-	
+	"Version": "2.0.0",
+
 	"Scripts": [
 		{
 			"Path": "SpeedTracker.nut",
@@ -21,61 +21,21 @@
 			}
 		}
 	],
+
 	"ConVars": [
 		{
-			"Name": "speed_tracker_size",
-			"DefaultValue": "24",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_base_alpha",
-			"DefaultValue": "1",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_position",
-			"DefaultValue": "0.78",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_width",
-			"DefaultValue": "0.5",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_colour",
-			"DefaultValue": "255 255 255 ",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_style",
-			"DefaultValue": "0",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_tracker_enable",
+			"Name": "speed_enable",
 			"DefaultValue": "1",
 			"Flags": 16777216
 		},
 		{
 			"Name": "hud_fontsize",
-			"DefaultValue": "34",
+			"DefaultValue": "24",
 			"Flags": 16777216
 		},
 		{
 			"Name": "hud_color",
 			"DefaultValue": "255 255 255 ",
-			"Flags": 16777216
-		},
-
-		{
-			"Name": "jump_enable",
-			"DefaultValue": "1",
-			"Flags": 16777216
-		},
-		{
-			"Name": "speed_enable",
-			"DefaultValue": "1",
 			"Flags": 16777216
 		},
 		{
@@ -96,6 +56,32 @@
 		{
 			"Name": "hud_layout_preset",
 			"DefaultValue": "0",
+			"Flags": 16777216
+		},
+
+		{
+			"Name": "st_enable",
+			"DefaultValue": "1",
+			"Flags": 16777216
+		},
+		{
+			"Name": "st_font_size",
+			"DefaultValue": "18",
+			"Flags": 16777216
+		},
+		{
+			"Name": "st_column_spacing",
+			"DefaultValue": "0.08",
+			"Flags": 16777216
+		},
+		{
+			"Name": "st_idle_timeout",
+			"DefaultValue": "1.0",
+			"Flags": 16777216
+		},
+		{
+			"Name": "st_history_count",
+			"DefaultValue": "4",
 			"Flags": 16777216
 		}
 	]

@@ -1,795 +1,413 @@
 untyped
 global function SpeedTrackerInit
-global function CreateCustomSpeedTrackerTracker
-global function CreateCustomSpeedTrackerWaypoint
 
-global struct CustomSpeedTrackerMarker
+// ─────────────────────────────────────────────
+//  Conversion constant: Hammer Units/s → km/h
+//  1 HU = 1.905 cm  →  1 HU/s = 0.01905 km/h
+//  (matches the 0.09144 factor used for mph → km/h elsewhere)
+// ─────────────────────────────────────────────
+const float HU_TO_KMH = 0.09144
+
+// Minimum km/h change that counts as "significant" for segment tracking
+const float MIN_SIGNIFICANT_KMH = 1.0
+
+struct ChangeEntry
 {
-	var rui = null                       // contains the RUI in the returned struct
-	entity target = null                 // target entity, used with CreateCustomCompassTracker
-	vector position = Vector(0,0,0)      // target location, used with CreateCustomCompassWaypoint
-	string imagePath = ""                // example: "$rui/menu/boosts/boost_icon_holopilot"
-	float imageScaleModifier = 1.0       //
-	vector colour = Vector(1.0, 1.0, 1.0)//
-	int compassRow = 2                   // 3 rows, indexed from 1 to 3
-
-	float baseAlphaModifier = 1.0        // for no change use 1.0
-	bool fadeWithDistance = false        //
-	bool useHorizontalDistance = true	 // distance calculations will only include the horizontal plane (x, y)
-	float maxVisibleDistance = 10000     // in HU
-	bool fadeWithTime = false            //
-	float startTime = 0.0                // in seconds
-	float duration = 10.0                // in seconds
+    float   value       // signed km/h delta (positive = gain, negative = loss)
+    float   timestamp   // Time() when this entry was recorded
 }
 
-struct HudElement
+struct TrackerColumn
 {
-    bool enabled
-    var rui
-    string text
+    var     headerRUI               // large "cumulative" text RUI
+    array<var> historyRUIs          // smaller per-change entries
+    float   cumulative              // running total for the current segment
+    array<ChangeEntry> history      // ring of recent individual changes
 }
-
 
 struct
 {
-	float size
-	float position
-	float baseAlpha
-	float compassWidth
-	int style
-	int isEnabled
-	vector colour
-	var[9][2] barRUIs // this is weird, looks like the indexing is swapped for some reason
-	var centerRUI
-	bool isVisible = false
+    // ── Settings ──────────────────────────────
+    bool    speedEnabled
+    bool    trackerEnabled
+    float   hudFontSize
+    vector  hudColor
+    float   baseX
+    float   baseY
+    float   spacing
 
-						// Jackson's edits
-	// Movement HUD elements
-	HudElement jump
-	HudElement speed
+    float   trackerFontSize         // size for column headers
+    float   historyFontSize         // size for per-change rows
+    int     historyCount            // 0–10 entries shown per column
+    float   idleTimeout             // seconds of inactivity before segment fades
+    float   columnSpacing           // horizontal gap between the 3 columns
 
-	// Movement HUD state variables for calculations
-	int jumpCount = 0
-	float lastVZ = 0.0				// (double jump and walljump inclusion in jump count)
-	float currentSpeed = 0.0
+    // ── Speed state ───────────────────────────
+    float   prevSpeedKmh            // horizontal speed last frame
+    float   currentSpeedKmh        // this frame
 
-	// Layout settings for the HUD column
-	float baseX = 0.42
-	float baseY = -0.45
-	float spacing = 0.01
+    // ── Segment state ─────────────────────────
+    float   lastChangeTime          // Time() of the last significant change
+    bool    segmentActive           // are we inside an active segment?
+    float   segmentAlpha            // 0.0–1.0, fades after idle
 
-	// HUD element style
-	float hudFontSize = 24.0
-	vector hudColor = <1.0, 1.0, 1.0>
+    // ── Per-column state ──────────────────────
+    TrackerColumn gainCol
+    TrackerColumn lossCol
+    TrackerColumn netCol
 
-	bool threadStarted = false		// for a bug that didn't affect the compass, but would restart the jump counter (occurred when tabbing out)
-}file
+    // ── Speedometer RUI ───────────────────────
+    var     speedRUI
 
-void function CompassInit()
+    bool    threadStarted
+} file
+
+// ═══════════════════════════════════════════════════════════════════
+void function SpeedTrackerInit()
 {
-	//RegisterButtonPressedCallback(MOUSE_LEFT, aaa) //Callback for debugging
-	if( !IsLobby() )
-	{
-		if (!file.threadStarted)
+    if ( !file.threadStarted )
+    {
+        file.threadStarted = true
+        thread SpeedTrackerThread()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+void function SpeedTrackerThread()
+{
+    UpdateSettings()
+
+    // Create all RUIs
+    file.speedRUI = CreateTextRUI( file.hudFontSize )
+
+    for ( int col = 0; col < 3; col++ )
+    {
+        TrackerColumn colRef = GetColumn( col )
+        colRef.headerRUI = CreateTextRUI( file.trackerFontSize )
+
+        // Pre-allocate max history RUIs (10)
+        for ( int h = 0; h < 10; h++ )
         {
-            file.threadStarted = true
-
-            RegisterSignal("DestroyTracker")
-            RegisterSignal("DestroyWaypoints")
-
-            thread CompassThread()
+            colRef.historyRUIs.append( CreateTextRUI( file.historyFontSize ) )
         }
-		//Register the custom signals, for trackers and for waypoints
-	}
-}
+    }
 
-void function UpdateJumpCounter()
-{
-    entity p = GetLocalViewPlayer()
-    if (!IsValid(p) || !IsAlive(p))
-        return
-
-    float vz = p.GetVelocity().z
-
-    // Detect upward impulse
-    if (file.lastVZ <= 0 && vz > 0)
-        file.jumpCount++
-
-    file.lastVZ = vz
-}
-
-void function UpdateSpeed()
-{
-    entity p = GetLocalViewPlayer()
-    if (!IsValid(p) || !IsAlive(p))
-        return
-
-    vector vel = p.GetVelocity()
-
-    float speed = sqrt(vel.x * vel.x + vel.y * vel.y)
-
-    file.currentSpeed = speed
-}
-
-void function CompassThread()
-{
-	UpdateSettings()
-
-	for(int k = 0; k < 2; ++k)
-	{
-    	printt("k = " + k)
-    	for(int i = 0; i < 9; ++i)
-    	{
-        	printt("i = " + i)
-        	file.barRUIs[k][i] = CreateCompassRUI()
-    	}
-	}
-
-
-	file.centerRUI = CreateCenterRUI()
-
-	file.jump.rui = CreateHudTextRUI()
-	file.speed.rui = CreateHudTextRUI()
-
-	HideCompass()
-
-	while(true)
-	{
-		WaitFrame()
-
-		UpdateSettings() //should be done only after changing mod settings, look for a callback or something
-
-		RuiSetFloat(file.jump.rui,  "msgFontSize", file.hudFontSize)
-		RuiSetFloat(file.speed.rui, "msgFontSize", file.hudFontSize)
-
-		if(ShouldShowCompass())
-		{
-			UpdateCompassRUIs()
-			file.isVisible = true
-		}
-		else if (file.isVisible)
-		{
-			HideCompass()
-			file.isVisible = false
-		}
-
-		// Update jump and speed logic
-		UpdateJumpCounter()
-		UpdateSpeed()
-
-		file.jump.text = "Jumps: " + file.jumpCount
-		RuiSetString(file.jump.rui, "msgText", file.jump.text)
-
-		float kmh = file.currentSpeed * 0.09144
-		file.speed.text = "Speed: " + floor(kmh).tostring() + " km/h"
-		RuiSetString(file.speed.rui, "msgText", file.speed.text)
-
-		// HUD stacking
-		array<HudElement> active = []
-
-		// Jump
-		if (file.jump.enabled)
-		{
-			active.append(file.jump)
-			SetHudElementVisible(file.jump, true)
-		}
-		else
-		{
-			SetHudElementVisible(file.jump, false)
-		}
-
-		// Speed
-		if (file.speed.enabled)
-		{
-			active.append(file.speed)
-			SetHudElementVisible(file.speed, true)
-		}
-		else
-		{
-			SetHudElementVisible(file.speed, false)
-		}
-
-        for (int i = 0; i < active.len(); i++)
+    // Seed previous speed so the first frame doesn't produce a false delta
+    {
+        entity p = GetLocalViewPlayer()
+        if ( IsValid(p) )
         {
-            float y = file.baseY + (i * file.spacing)
-            RuiSetFloat2(active[i].rui, "msgPos", <file.baseX, y, 0>)
+            vector vel = p.GetVelocity()
+            file.prevSpeedKmh = sqrt( vel.x*vel.x + vel.y*vel.y ) * HU_TO_KMH
+        }
+    }
+
+    while ( true )
+    {
+        WaitFrame()
+
+        UpdateSettings()
+
+        bool alive = IsValid( GetLocalViewPlayer() ) && IsAlive( GetLocalViewPlayer() )
+
+        if ( !alive )
+        {
+            HideAll()
+            continue
         }
 
-	}
+        // ── Speed sampling ────────────────────────────────────────
+        entity p = GetLocalViewPlayer()
+        vector vel = p.GetVelocity()
+        file.currentSpeedKmh = sqrt( vel.x * vel.x + vel.y * vel.y ) * HU_TO_KMH
+
+        float delta = file.currentSpeedKmh - file.prevSpeedKmh  // signed, km/h
+
+        // ── Segment / change tracking ─────────────────────────────
+        if ( fabs_c( delta ) >= MIN_SIGNIFICANT_KMH )
+        {
+            file.lastChangeTime = Time()
+
+            if ( !file.segmentActive )
+            {
+                // New segment — reset cumulative totals and history
+                file.segmentActive = true
+                ResetColumn( file.gainCol )
+                ResetColumn( file.lossCol )
+                ResetColumn( file.netCol )
+            }
+
+            // Accumulate
+            file.netCol.cumulative += delta
+
+            if ( delta > 0 )
+            {
+                file.gainCol.cumulative += delta
+                RecordChange( file.gainCol, delta )
+            }
+            else
+            {
+                file.lossCol.cumulative += delta
+                RecordChange( file.lossCol, delta )
+            }
+
+            RecordChange( file.netCol, delta )
+
+            file.segmentAlpha = 1.0
+        }
+
+        // ── Fade logic ────────────────────────────────────────────
+        if ( file.segmentActive )
+        {
+            float idle = Time() - file.lastChangeTime
+            if ( idle > file.idleTimeout )
+            {
+                // Fade proportionally after the timeout elapses
+                float fadeProgress = ( idle - file.idleTimeout ) / max_c( 0.5, file.idleTimeout * 0.5 )
+                file.segmentAlpha = clamp_f( 1.0 - fadeProgress, 0.0, 1.0 )
+
+                if ( file.segmentAlpha <= 0.0 )
+                    file.segmentActive = false
+            }
+        }
+
+        // ── Draw speedometer ──────────────────────────────────────
+        if ( file.speedEnabled )
+        {
+            string speedStr = "Speed: " + int( file.currentSpeedKmh ).tostring() + " km/h"
+            RuiSetString( file.speedRUI, "msgText", speedStr )
+            RuiSetFloat( file.speedRUI, "msgFontSize", file.hudFontSize )
+            RuiSetFloat3( file.speedRUI, "msgColor", file.hudColor )
+            RuiSetFloat( file.speedRUI, "msgAlpha", 1.0 )
+            RuiSetFloat2( file.speedRUI, "msgPos", <file.baseX, file.baseY, 0> )
+        }
+        else
+        {
+            RuiSetFloat( file.speedRUI, "msgAlpha", 0.0 )
+        }
+
+        // ── Draw tracker columns ──────────────────────────────────
+        if ( file.trackerEnabled && file.segmentActive )
+        {
+            // Y anchor — place below the speedometer (or at baseY if speedometer is off)
+            float trackerBaseY = file.speedEnabled
+                ? ( file.baseY + file.spacing )
+                : file.baseY
+
+            // 3 columns centred around baseX
+            // col 0 = gain (left), col 1 = loss (centre), col 2 = net (right)
+            float[3] colX
+            colX[0] = file.baseX - file.columnSpacing
+            colX[1] = file.baseX
+            colX[2] = file.baseX + file.columnSpacing
+
+            DrawColumn( file.gainCol, colX[0], trackerBaseY, file.segmentAlpha, true )
+            DrawColumn( file.lossCol, colX[1], trackerBaseY, file.segmentAlpha, false )
+            DrawColumn( file.netCol,  colX[2], trackerBaseY, file.segmentAlpha, false )
+        }
+        else if ( !file.trackerEnabled || !file.segmentActive )
+        {
+            HideTrackerColumns()
+        }
+
+        file.prevSpeedKmh = file.currentSpeedKmh
+    }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  Column helpers
+// ═══════════════════════════════════════════════════════════════════
 
-var function CreateCompassRUI()
+TrackerColumn function GetColumn( int index )
 {
-	var rui = RuiCreate( $"ui/cockpit_console_text_center.rpak", clGlobal.topoCockpitHudPermanent, RUI_DRAW_COCKPIT, -1 )
-	RuiSetInt(rui, "maxLines", 3)
-	RuiSetInt(rui, "lineNum", 1)
-	RuiSetFloat2(rui, "msgPos", <0,0,0>)
-	RuiSetString(rui, "msgText", " | ")
-	RuiSetFloat(rui, "msgFontSize", file.size)
-	RuiSetFloat(rui, "msgAlpha", file.baseAlpha)
-	RuiSetFloat(rui, "thicken", 0.0)
-	RuiSetFloat3(rui, "msgColor", <1,1,1>)
-	return rui
+    switch ( index )
+    {
+        case 0: return file.gainCol
+        case 1: return file.lossCol
+        default: return file.netCol
+    }
+
+    return file.netCol
 }
 
-var function CreateCenterRUI()
+void function ResetColumn( TrackerColumn col )
 {
-	var rui = RuiCreate( $"ui/cockpit_console_text_center.rpak", clGlobal.topoCockpitHudPermanent, RUI_DRAW_COCKPIT, -1 )
-	RuiSetInt(rui, "maxLines", 3)
-	RuiSetInt(rui, "lineNum", 1)
-	RuiSetFloat2(rui, "msgPos", <0,0,0>)
-	RuiSetString(rui, "msgText", "\\|/\n   \n   ")
-	RuiSetFloat(rui, "msgFontSize", file.size)
-	RuiSetFloat(rui, "msgAlpha", file.baseAlpha)
-	RuiSetFloat(rui, "thicken", 0.0)
-	RuiSetFloat3(rui, "msgColor", <1,1,1>)
-	return rui
+    col.cumulative = 0.0
+    col.history.clear()
 }
 
-var function CreateHudTextRUI()
+void function RecordChange( TrackerColumn col, float delta )
+{
+    ChangeEntry entry
+    entry.value     = delta
+    entry.timestamp = Time()
+
+    col.history.insert( 0, entry )  // newest at index 0
+
+    // Trim to max history size
+    while ( col.history.len() > 10 )
+        col.history.remove( col.history.len() - 1 )
+}
+
+void function DrawColumn( TrackerColumn col, float x, float baseY, float alpha, bool isGain )
+{
+    // Header: cumulative value
+    string sign   = col.cumulative >= 0 ? "+" : ""
+    string header = sign + int( col.cumulative ).tostring()
+
+    RuiSetString( col.headerRUI, "msgText", header )
+    RuiSetFloat( col.headerRUI, "msgFontSize", file.trackerFontSize )
+    RuiSetFloat3( col.headerRUI, "msgColor", file.hudColor )
+    RuiSetFloat( col.headerRUI, "msgAlpha", alpha )
+    RuiSetFloat2( col.headerRUI, "msgPos", <x, baseY, 0> )
+
+    // History rows
+    int visibleHistory = min_c( file.historyCount, col.history.len() )
+    float rowSpacing   = file.spacing * 0.7   // tighter than the main spacing
+
+    for ( int h = 0; h < 10; h++ )
+    {
+        var rui = col.historyRUIs[ h ]
+
+        if ( h < visibleHistory )
+        {
+            ChangeEntry entry = col.history[ h ]
+            string entrySign  = entry.value >= 0 ? "+" : ""
+            string entryStr   = entrySign + int( entry.value ).tostring()
+
+            float rowY = baseY + file.spacing + ( h * rowSpacing )
+
+            RuiSetString( rui, "msgText", entryStr )
+            RuiSetFloat( rui, "msgFontSize", file.historyFontSize )
+            RuiSetFloat3( rui, "msgColor", file.hudColor )
+            RuiSetFloat( rui, "msgAlpha", alpha * 0.65 )   // slightly dimmer than header
+            RuiSetFloat2( rui, "msgPos", <x, rowY, 0> )
+        }
+        else
+        {
+            RuiSetFloat( rui, "msgAlpha", 0.0 )
+        }
+    }
+}
+
+void function HideTrackerColumns()
+{
+    for ( int col = 0; col < 3; col++ )
+    {
+        TrackerColumn c = GetColumn( col )
+        RuiSetFloat( c.headerRUI, "msgAlpha", 0.0 )
+        for ( int h = 0; h < 10; h++ )
+            RuiSetFloat( c.historyRUIs[h], "msgAlpha", 0.0 )
+    }
+}
+
+void function HideAll()
+{
+    RuiSetFloat( file.speedRUI, "msgAlpha", 0.0 )
+    HideTrackerColumns()
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RUI factory
+// ═══════════════════════════════════════════════════════════════════
+var function CreateTextRUI( float fontSize )
 {
     var rui = RuiCreate(
-    	$"ui/cockpit_console_text_center.rpak",
-    	clGlobal.topoCockpitHudPermanent,
-    	RUI_DRAW_COCKPIT,
-    	-1
-	)
-
-    RuiSetInt(rui, "maxLines", 1)
-    RuiSetInt(rui, "lineNum", 1)
-
-    // These will be overwritten each frame by your layout system
-    RuiSetFloat2(rui, "msgPos", <0, 0, 0>)
-
-    // Unified style (color + font size)
-    RuiSetFloat(rui, "msgFontSize", file.hudFontSize)
-    RuiSetFloat3(rui, "msgColor", file.hudColor)
-    RuiSetFloat(rui, "msgAlpha", 1.0)
-
+        $"ui/cockpit_console_text_center.rpak",
+        clGlobal.topoCockpitHudPermanent,
+        RUI_DRAW_COCKPIT,
+        -1
+    )
+    RuiSetInt( rui, "maxLines", 1 )
+    RuiSetInt( rui, "lineNum", 1 )
+    RuiSetFloat2( rui, "msgPos", <0, 0, 0> )
+    RuiSetFloat( rui, "msgFontSize", fontSize )
+    RuiSetFloat3( rui, "msgColor", <1, 1, 1> )
+    RuiSetFloat( rui, "msgAlpha", 0.0 )
+    RuiSetFloat( rui, "thicken", 0.0 )
     return rui
 }
 
-void function UpdateCompassRUIs()
-{
-	float xAngle = (GetLocalViewPlayer().EyeAngles().y - 180) * (-1) //View angle in degrees (range -180 to 180 by default, correcting)
-	float offset = GetBarOffset(xAngle)
-	float barPosition
-	float alpha = 1.0
-
-	if(file.style == 0) //Style: Bars
-	{
-		for(int i = 0; i<9; ++i)
-		{
-			barPosition = GetBarPosition(i, offset)
-			alpha = GetBarAlpha(barPosition)
-			RuiSetString(file.barRUIs[0][i], "msgText", GetBarValue(i, xAngle, offset))
-			RuiSetString(file.barRUIs[1][i], "msgText", " \n|\n ")
-
-			for(int k = 0; k<2; ++k)
-			{
-				RuiSetFloat2(file.barRUIs[k][i], "msgPos", <barPosition, file.position, 0>)
-				RuiSetFloat(file.barRUIs[k][i], "msgAlpha", alpha)
-
-				RuiSetFloat(file.barRUIs[k][i], "msgFontSize", file.size)
-				RuiSetFloat3(file.barRUIs[k][i], "msgColor", file.colour)
-			}
-		}
-
-
-		//	Center RUI
-		RuiSetString(file.centerRUI, "msgText", "\\|/\n   \n   ")
-		RuiSetFloat(file.centerRUI, "msgFontSize", file.size)
-		RuiSetFloat3(file.centerRUI, "msgColor", file.colour)
-		RuiSetFloat(file.centerRUI, "msgAlpha", file.baseAlpha)
-		RuiSetFloat2(file.centerRUI, "msgPos", <0, file.position, 0>)
-	}
-	else if(file.style == 1) //Style: Minimalistic
-	{
-		for(int i = 0; i<9; ++i)
-		{
-			barPosition = GetBarPosition(i, offset)
-			alpha = GetBarAlpha(barPosition)
-			RuiSetString(file.barRUIs[0][i], "msgText", GetBarValue(i, xAngle, offset))
-			RuiSetString(file.barRUIs[1][i], "msgText", "")
-
-			for(int k = 0; k<2; ++k)
-			{
-				RuiSetFloat2(file.barRUIs[k][i], "msgPos", <barPosition, file.position, 0>)
-				RuiSetFloat(file.barRUIs[k][i], "msgAlpha", alpha)
-
-				RuiSetFloat(file.barRUIs[k][i], "msgFontSize", file.size)
-				RuiSetFloat3(file.barRUIs[k][i], "msgColor", file.colour)
-			}
-		}
-
-		//	Center RUI
-		RuiSetString(file.centerRUI, "msgText", "\\|/\n   \n   ")
-		RuiSetFloat(file.centerRUI, "msgFontSize", file.size)
-		RuiSetFloat3(file.centerRUI, "msgColor", file.colour)
-		RuiSetFloat(file.centerRUI, "msgAlpha", file.baseAlpha)
-		RuiSetFloat2(file.centerRUI, "msgPos", <0, file.position, 0>)
-	}
-	else //Style: Number
-	{
-		for(int i = 0; i<9; ++i)
-		{
-			barPosition = GetBarPosition(i, offset)
-			alpha = GetBarAlpha(barPosition)
-			RuiSetString(file.barRUIs[0][i], "msgText", GetBarValue(i, xAngle, offset))
-			RuiSetString(file.barRUIs[1][i], "msgText", "")
-
-			for(int k = 0; k<2; ++k)
-			{
-				RuiSetFloat2(file.barRUIs[k][i], "msgPos", <barPosition, file.position, 0>)
-				RuiSetFloat(file.barRUIs[k][i], "msgAlpha", alpha)
-
-				RuiSetFloat(file.barRUIs[k][i], "msgFontSize", file.size)
-				RuiSetFloat3(file.barRUIs[k][i], "msgColor", file.colour)
-			}
-		}
-
-		//	Center RUI
-		int angleNumber = (int(xAngle) + 180)%360 //could be optimized out, don't wanna bother rn so TODO
-
-		//RuiSetString(file.centerRUI, "msgText", "\\|/\n   \n" + (angleNumber.tostring().len() == 1 ? " " + angleNumber.tostring() + " " : angleNumber.tostring())) // TODO
-		RuiSetString(file.centerRUI, "msgText", "\\|/\n   \n   ")
-		RuiSetFloat(file.centerRUI, "msgFontSize", file.size)
-		RuiSetFloat3(file.centerRUI, "msgColor", file.colour)
-		RuiSetFloat(file.centerRUI, "msgAlpha", file.baseAlpha)
-		RuiSetFloat2(file.centerRUI, "msgPos", <0, file.position, 0>)
-		// This is not the correct way to do this but I have no better idea rn
-		// Fixing center RUI angle value offset
-		RuiSetString(file.barRUIs[1][4], "msgText", "\n\n" + angleNumber.tostring()) // stealing a bar RUI for a moment
-		RuiSetFloat2(file.barRUIs[1][4], "msgPos", <0, file.position, 0>)
-		RuiSetFloat(file.barRUIs[1][4], "msgAlpha", file.baseAlpha)
-
-	}
-
-}
-
+// ═══════════════════════════════════════════════════════════════════
+//  Settings
+// ═══════════════════════════════════════════════════════════════════
 void function UpdateSettings()
 {
-    // Compass settings
-    file.size        = GetConVarFloat("compass_size")
-    file.baseAlpha   = GetConVarFloat("compass_base_alpha")
-    file.position    = GetConVarFloat("compass_position") * (-0.57)
-    file.compassWidth = GetConVarFloat("compass_width")
-    file.colour      = GetConVarFloat3("compass_colour") / 255.0 
-    file.style       = GetConVarInt("compass_style")
-    file.isEnabled   = GetConVarInt("compass_enable")
+    file.speedEnabled       = GetConVarBool( "speed_enable" )
+    file.trackerEnabled     = GetConVarBool( "st_enable" )
 
-    // Movement HUD style and layout
-    file.hudFontSize = GetConVarFloat("hud_fontsize")
-    file.hudColor    = GetConVarFloat3("hud_color") / 255.0
-	file.baseX   = GetConVarFloat("hud_base_x")
-	file.baseY   = GetConVarFloat("hud_base_y")
-	file.spacing = GetConVarFloat("hud_spacing")
+    file.hudFontSize        = GetConVarFloat( "hud_fontsize" )
+    file.hudColor           = GetConVarFloat3( "hud_color" ) / 255.0
+    file.baseX              = GetConVarFloat( "hud_base_x" )
+    file.baseY              = GetConVarFloat( "hud_base_y" )
+    file.spacing            = GetConVarFloat( "hud_spacing" )
 
-	int preset = GetConVarInt("hud_layout_preset")
+    file.trackerFontSize    = GetConVarFloat( "st_font_size" )
+    file.historyFontSize    = file.trackerFontSize * 0.65
+    file.historyCount       = clamp_i( GetConVarInt( "st_history_count" ), 0, 10 )
+    file.idleTimeout        = max_c( 0.1, GetConVarFloat( "st_idle_timeout" ) )
+    file.columnSpacing      = GetConVarFloat( "st_column_spacing" )
 
-    if (preset != 0)
-{
-    file.spacing     = 0.03
-    file.hudFontSize = 34
-
-    switch (preset)
+    // Layout presets
+    int preset = GetConVarInt( "hud_layout_preset" )
+    if ( preset != 0 )
     {
-        case 1: file.baseX = -0.27; file.baseY = 0.27; break
-        case 2: file.baseX = -0.41; file.baseY = -0.24; break
-        case 3: file.baseX = 0.4;   file.baseY = -0.475; break
-        case 4: file.baseX = -0.1;  file.baseY = 0.0; break
-        case 5: file.baseX = 0.1;   file.baseY = 0.0; break
+        file.spacing     = 0.03
+        file.hudFontSize = 34
+
+        switch ( preset )
+        {
+            case 1: file.baseX = -0.27; file.baseY =  0.27;   break
+            case 2: file.baseX = -0.41; file.baseY = -0.24;   break
+            case 3: file.baseX =  0.4;  file.baseY = -0.475;  break
+            case 4: file.baseX = -0.1;  file.baseY =  0.0;    break
+            case 5: file.baseX =  0.1;  file.baseY =  0.0;    break
+        }
     }
 }
 
-
-    // Movement HUD
-    file.jump.enabled  = GetConVarBool("jump_enable")
-    file.speed.enabled = GetConVarBool("speed_enable")
-}
-
-bool function ShouldShowCompass()
+// ─────────────────────────────────────────────────────────────────
+//  Utility: parse a "X Y Z" convar into a vector
+// ─────────────────────────────────────────────────────────────────
+vector function GetConVarFloat3( string convar )
 {
-	if(file.isEnabled && IsValid(GetLocalViewPlayer()) && IsAlive(GetLocalViewPlayer()))
-		return true
-	return false
-
-	// if (!IsAlive(GetLocalViewPlayer()))		// If you want jump counter to reset with each death
-    // 	file.jumpCount = 0
-}
-
-void function SetHudElementVisible(HudElement elem, bool visible)
-{
-    if (!IsValid(elem.rui))
-        return
-
-    float alpha = visible ? 1.0 : 0.0
-    RuiSetFloat(elem.rui, "msgAlpha", alpha)
-}
-
-void function HideCompass()
-{
-	for(int k = 0; k < 2; ++k)
-	{
-		for(int i = 0; i < 9; ++i)
-		{
-			RuiSetFloat(file.barRUIs[k][i], "msgAlpha", 0)
-		}
-	}
-
-
-	RuiSetFloat(file.centerRUI, "msgAlpha", 0)
-}
-
-
-
-float function GetBarOffset(float angle)
-{
-	float angleReduced = angle - ((int(angle)/15) * 15)
-
-	float temp = ((angleReduced - 7.5) / 7.5) //the result here is a value from -1 to 1
-
-	float offset = 0
-
-	//I forgot what happens here, I'm just glad it works
-	if (temp < 0)
-		offset = ((1 - fabs(temp)) * (file.compassWidth/18)) * (-1.0)
-	else
-		offset = (1 - temp) * (file.compassWidth/18)
-
-	return offset
-}
-
-float function GetBarPosition(int index, float offset)
-{
-	return (index * file.compassWidth/9 + file.compassWidth/18 + offset) - file.compassWidth/2
-}
-
-float function GetBarAlpha(float position)
-{
-	return file.baseAlpha * ((file.compassWidth/2 - fabs(position)) / (file.compassWidth / 2))
-}
-
-string function GetBarValue(int index, float angle, float offset)
-{
-	//Calculation for bar 4
-
-	//We need to move the angle by 180 to face north (could be optimized by moving to the Update function, would require changes to passed args)
-	int iAngle = (int(angle) + 180)%360
-
-	int result = 0
-	if(offset >= 0)
-		result = ((iAngle - iAngle%15) + 15)
-	else
-		result = ((iAngle - iAngle%15))
-
-	result += 360 //Correction for mirroring close to 0
-
-	//Value for other bars:
-	result = abs(result + 15 * (index - 4)) % 360
-
-	string str = ""
-
-	switch (result)
-	{
-		case 0:
-			str = "N"
-			break
-		case 45:
-			str = "NE"
-			break
-		case 90:
-			str = "E"
-			break
-		case 135:
-			str = "SE"
-			break
-		case 180:
-			str = "S"
-			break
-		case 225:
-			str = "SW"
-			break
-		case 270:
-			str = "W"
-			break
-		case 315:
-			str = "NW"
-			break
-		default:
-			if(file.style == 2)
-				str = "|"
-			else
-				str = result.tostring()
-			break
-	}
-
-	// Style dependent results
-	// In all cases these values should be applied to just one RUI row, as the other will only contain constant elements
-	int len = str.len()
-
-	if(file.style == 0) // Bars
-	{
-		switch (len)
-		{
-			case 1:
-				str = " \n \n" + str
-				break
-			case 2:
-				str = "  \n  \n" + str
-				break
-			case 3:
-				str = "   \n   \n" + str
-				break
-		}
-	}
-	else if(file.style == 1 || file.style == 2) // Minimalistic || Number (both use row 2, implementation is the same)
-	{
-		switch (len)
-		{
-			case 1:
-				str = " \n" + str + "\n "
-				break
-			case 2:
-				str = "  \n" + str + "\n  "
-				break
-			case 3:
-				str = "   \n" + str + "\n   "
-				break
-		}
-	}
-	else // Empty
-	{
-
-	}
-
-	return str
-}
-
-//Stolen from 4V (thanks nerd)
-vector function GetConVarFloat3(string convar)
-{
-    array<string> value = split(GetConVarString(convar), " ")
-    try{
-        return Vector(value[0].tofloat(), value[1].tofloat(), value[2].tofloat())
+    array<string> value = split( GetConVarString( convar ), " " )
+    try
+    {
+        return Vector( value[0].tofloat(), value[1].tofloat(), value[2].tofloat() )
     }
-    catch(ex){
-        throw "Invalid convar " + convar + "! make sure it is a float3 and formatted as \"X Y Z\""
+    catch ( ex )
+    {
+        throw "Invalid convar " + convar + "! make sure it is a float3 formatted as \"X Y Z\""
     }
     unreachable
 }
 
-//==================================================================================================================
-
-//Functions for creating custom compass markers
-void function CreateCustomCompassTracker( CustomCompassMarker data )
+float function fabs_c( float x )
 {
-	data.rui = CreateCompassRUI()
-	string ruiString = ""
-
-	// Validity checks for values here? Or do we rely on the modder being competent?
-
-	switch( data.compassRow )
-	{
-		case 1:
-			ruiString = "%" + data.imagePath + "%\n\n"
-			break
-		case 2:
-			ruiString = "\n%" + data.imagePath + "%\n"
-			break
-		default:
-			ruiString = "\n\n%" + data.imagePath + "%"
-			break
-	}
-
-	RuiSetString(data.rui, "msgText", ruiString )
-	RuiSetFloat3(data.rui, "msgColor", data.colour )
-
-	thread MaintainCustomCompassTracker( data )
+    return x < 0.0 ? x * -1.0 : x
 }
 
-
-void function CreateCustomCompassWaypoint( CustomCompassMarker data )
+int function clamp_i( int v, int lo, int hi )
 {
-	data.rui = CreateCompassRUI()
-	string ruiString = ""
-
-	switch( data.compassRow )
-	{
-		case 1:
-			ruiString = "%" + data.imagePath + "%\n\n"
-			break
-		case 2:
-			ruiString = "\n%" + data.imagePath + "%\n"
-			break
-		default:
-			ruiString = "\n\n%" + data.imagePath + "%"
-			break
-	}
-
-	RuiSetString(data.rui, "msgText", ruiString )
-	RuiSetFloat3(data.rui, "msgColor", data.colour )
-
-	thread MaintainCustomCompassWaypoint( data )
-}
-//Remember to add these newly created ruis to an array, which we will use to hide them with the HideCompass function, or use ShouldShowCompass
-//Might turn out to not be necessary
-
-
-//Funcs for maintaining the RUIs, they run as threads and update/delete them
-void function MaintainCustomCompassTracker( CustomCompassMarker data ) //add more args
-{
-	data.target.EndSignal( "OnDestroy" )
-	//data.target.EndSignal( "OnDeath" )
-	data.target.EndSignal( "DestroyTracker" )
-
-	vector vec
-	vector newAngles
-	float angle
-	float imagePosition
-	//bool isVisible = true
-
-
-	//DEBUG
-	//thread kys(target)
-	//DEBUG END
-
-
-	OnThreadEnd(
-		function() : ( data )
-		{
-			//Logger.Info("Thread ended!")
-			printt("Thread ended!")
-			if(data.rui != null)
-			{
-				RuiDestroyIfAlive(data.rui)
-			}
-		}
-	)
-
-	for(;;)
-	{
-		WaitFrame()
-
-		vec =  data.target.GetOrigin() - GetLocalClientPlayer().GetOrigin()
-		newAngles = VectorToAngles( vec )
-		//Logger.Info((360.0 - newAngles.y).tostring()) //Y is our argument
-		//East and west are swapped
-		//The rotation is in the opposite direction
-		//adding 360.0 - fixed it
-		angle = 360.0 - newAngles.y
-
-		imagePosition = GetImagePosition( angle )
-
-		RuiSetFloat2(data.rui, "msgPos", < imagePosition, file.position, 0 > )
-		RuiSetFloat(data.rui, "msgAlpha", GetImageAlpha( imagePosition, data ) )
-		RuiSetFloat(data.rui, "msgFontSize", file.size * data.imageScaleModifier )
-	}
-
+    if ( v < lo ) return lo
+    if ( v > hi ) return hi
+    return v
 }
 
-
-void function MaintainCustomCompassWaypoint( CustomCompassMarker data )
+float function clamp_f( float v, float lo, float hi )
 {
-	GetLocalClientPlayer().EndSignal( "DestroyWaypoints" )
-
-	vector vec
-	vector newAngles
-	float angle
-	float imagePosition
-	//bool isVisible = true
-
-	OnThreadEnd(
-		function() : ( data )
-		{
-			//Logger.Info("Thread ended!")
-			printt("Thread ended!")
-			if(data.rui != null)
-			{
-				RuiDestroyIfAlive(data.rui)
-			}
-		}
-	)
-
-	for(;;)
-	{
-		WaitFrame()
-
-		vec =  data.position - GetLocalClientPlayer().GetOrigin()
-		newAngles = VectorToAngles( vec )
-		angle = 360.0 - newAngles.y
-
-		imagePosition = GetImagePosition( angle )
-
-		RuiSetFloat2(data.rui, "msgPos", < imagePosition, file.position, 0 > )
-		RuiSetFloat(data.rui, "msgAlpha", GetImageAlpha( imagePosition, data ) )
-		RuiSetFloat(data.rui, "msgFontSize", file.size * data.imageScaleModifier )
-	}
+    if ( v < lo ) return lo
+    if ( v > hi ) return hi
+    return v
 }
 
-
-float function GetImagePosition(float angle)
+float function max_c( float a, float b )
 {
-	float eyeAngle = fmod(((GetLocalViewPlayer().EyeAngles().y - 180) * (-1.0)) + 180.0, 360.0)
-	float x = angle - eyeAngle
-	float uDiff = min( fabs(x), fabs( fabs(x) - 360.0 ) )
-
-	//Nasty-ass fuckin math
-	float diff = uDiff //temporary assignment in case of :clueless:
-	float eyeAngle2 = fmod( (eyeAngle + 180), 360.0 )
-
-	if(eyeAngle > 180)
-	{
-		if( (angle >= 0 && angle <= eyeAngle2) || (angle > eyeAngle && angle < 360) )
-			diff = uDiff
-		else
-			diff = uDiff * (-1.0)
-	}
-	else
-	{
-		if( (angle >= 0 && angle <= eyeAngle) || (angle > eyeAngle2 && angle < 360) )
-			diff = uDiff * (-1.0)
-		else
-			diff = uDiff
-	}
-
-	return (diff / 67.5) * (file.compassWidth / 2)
+    return a > b ? a : b
 }
 
-
-float function GetImageAlpha(float position, CustomCompassMarker data)
+int function min_c( int a, int b )
 {
-	if(!file.isVisible)
-		return 0.0
-
-	float alpha = file.baseAlpha * ((file.compassWidth/2 - fabs(position)) / (file.compassWidth / 2))
-
-	alpha *= data.baseAlphaModifier
-
-	if(data.fadeWithDistance)
-	{
-		float hDist // distance in hammer units
-		if(data.useHorizontalDistance)
-			hDist = HorizontalDistance( data.target.GetOrigin(), GetLocalClientPlayer().GetOrigin() )
-		else
-			hDist = Distance( data.target.GetOrigin(), GetLocalClientPlayer().GetOrigin() )
-
-		float diff = data.maxVisibleDistance - hDist
-		if(diff > 0)
-		{
-			alpha *= diff/data.maxVisibleDistance // we trust it was not set to 0 lmao
-		}
-		else
-		{
-			alpha *= 0
-		}
-	}
-
-	if(data.fadeWithTime)
-	{
-		float currTime = Time()
-
-		if(currTime - data.startTime < data.duration)
-		{
-			alpha *= ((data.duration - (currTime - data.startTime)) / data.duration)
-		}
-		else
-		{
-			alpha *= 0
-		}
-	}
-
-	return alpha
-}
-
-
-float function fmod( float x, float y ) //the fuck
-{
-	return x - y * int(x / y)
-}
-
-float function HorizontalDistance(vector v1, vector v2)
-{
-	return sqrt((v1.x - v2.x) * (v1.x - v2.x)) + sqrt((v1.y - v2.y) * (v1.y - v2.y))
+    return a < b ? a : b
 }
