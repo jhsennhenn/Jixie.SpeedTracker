@@ -3,9 +3,9 @@ global function SpeedTrackerModSettingsHookup
 
 void function SpeedTrackerModSettingsHookup()
 {
-    // ══════════════════════════════════
+    // ==================================
     //  SPEEDOMETER
-    // ══════════════════════════════════
+    // ==================================
     ModSettings_AddModTitle( "Speed Tracker" )
     ModSettings_AddModCategory( "Speedometer" )
 
@@ -21,9 +21,9 @@ void function SpeedTrackerModSettingsHookup()
         [ "Custom", "Above Ammo", "Below Radar", "Top Right", "Left of Crosshair", "Right of Crosshair" ]
     )
 
-    // ══════════════════════════════════
+    // ==================================
     //  SPEED CHANGE TRACKER
-    // ══════════════════════════════════
+    // ==================================
     ModSettings_AddModCategory( "Speed Change Tracker" )
 
     ModSettings_AddEnumSetting( "st_enable", "Enable Speed Tracker", [ "Disabled", "Enabled" ] )
@@ -32,6 +32,9 @@ void function SpeedTrackerModSettingsHookup()
 
     // How long a quiet period before the segment fades
     ModSettings_AddSliderSetting( "st_idle_timeout", "Idle Timeout (seconds)", 0.2, 10.0, 0.1, false )
+
+    // Single-change size that resets the cumulative header
+    ModSettings_AddSliderSetting( "st_reset_threshold", "Cumulative Reset Threshold (km/h)", 1.0, 50.0, 0.5, false )
 
     // Number of individual changes shown below each column header (0 = header only)
     ModSettings_AddSliderSetting( "st_history_count", "History Entries per Column (0-10)", 0, 10, 1, true )

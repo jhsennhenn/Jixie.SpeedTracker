@@ -1,11 +1,6 @@
 untyped
 global function SpeedTrackerInit
 
-// ─────────────────────────────────────────────
-//  Conversion constant: Hammer Units/s → km/h
-//  1 HU = 1.905 cm  →  1 HU/s = 0.01905 km/h
-//  (matches the 0.09144 factor used for mph → km/h elsewhere)
-// ─────────────────────────────────────────────
 const float HU_TO_KMH = 0.09144
 
 // Minimum km/h change that counts as "significant" for segment tracking
@@ -27,7 +22,7 @@ struct TrackerColumn
 
 struct
 {
-    // ── Settings ──────────────────────────────
+    // Settings
     bool    speedEnabled
     bool    trackerEnabled
     float   hudFontSize
@@ -41,28 +36,28 @@ struct
     int     historyCount            // 0–10 entries shown per column
     float   idleTimeout             // seconds of inactivity before segment fades
     float   columnSpacing           // horizontal gap between the 3 columns
+    float   resetThreshold          // km/h single-change size that resets the cumulative header
 
-    // ── Speed state ───────────────────────────
+    // Speed state
     float   prevSpeedKmh            // horizontal speed last frame
     float   currentSpeedKmh        // this frame
 
-    // ── Segment state ─────────────────────────
+    // Segment state
     float   lastChangeTime          // Time() of the last significant change
     bool    segmentActive           // are we inside an active segment?
     float   segmentAlpha            // 0.0–1.0, fades after idle
 
-    // ── Per-column state ──────────────────────
+    // Per-column state
     TrackerColumn gainCol
     TrackerColumn lossCol
     TrackerColumn netCol
 
-    // ── Speedometer RUI ───────────────────────
+    // Speedometer RUI
     var     speedRUI
 
     bool    threadStarted
 } file
 
-// ═══════════════════════════════════════════════════════════════════
 void function SpeedTrackerInit()
 {
     if ( !file.threadStarted )
@@ -72,7 +67,6 @@ void function SpeedTrackerInit()
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
 void function SpeedTrackerThread()
 {
     UpdateSettings()
@@ -116,28 +110,39 @@ void function SpeedTrackerThread()
             continue
         }
 
-        // ── Speed sampling ────────────────────────────────────────
+        // Speed sampling
         entity p = GetLocalViewPlayer()
         vector vel = p.GetVelocity()
         file.currentSpeedKmh = sqrt( vel.x * vel.x + vel.y * vel.y ) * HU_TO_KMH
 
         float delta = file.currentSpeedKmh - file.prevSpeedKmh  // signed, km/h
 
-        // ── Segment / change tracking ─────────────────────────────
+        // Segment / change tracking
         if ( fabs_c( delta ) >= MIN_SIGNIFICANT_KMH )
         {
             file.lastChangeTime = Time()
 
             if ( !file.segmentActive )
             {
-                // New segment — reset cumulative totals and history
+                // New segment — reset everything
                 file.segmentActive = true
                 ResetColumn( file.gainCol )
                 ResetColumn( file.lossCol )
                 ResetColumn( file.netCol )
             }
 
-            // Accumulate
+            // If this single change is large enough, reset the cumulative
+            // totals so the header reflects only this new burst — but keep
+            // the history entries and the segment alive.
+            bool bigChange = fabs_c( delta ) >= file.resetThreshold
+            if ( bigChange )
+            {
+                file.gainCol.cumulative = 0.0
+                file.lossCol.cumulative = 0.0
+                file.netCol.cumulative  = 0.0
+            }
+
+            // Accumulate into (potentially freshly zeroed) totals
             file.netCol.cumulative += delta
 
             if ( delta > 0 )
@@ -156,7 +161,7 @@ void function SpeedTrackerThread()
             file.segmentAlpha = 1.0
         }
 
-        // ── Fade logic ────────────────────────────────────────────
+        // Fade logic
         if ( file.segmentActive )
         {
             float idle = Time() - file.lastChangeTime
@@ -171,7 +176,7 @@ void function SpeedTrackerThread()
             }
         }
 
-        // ── Draw speedometer ──────────────────────────────────────
+        // Draw speedometer
         if ( file.speedEnabled )
         {
             string speedStr = "Speed: " + int( file.currentSpeedKmh ).tostring() + " km/h"
@@ -186,7 +191,7 @@ void function SpeedTrackerThread()
             RuiSetFloat( file.speedRUI, "msgAlpha", 0.0 )
         }
 
-        // ── Draw tracker columns ──────────────────────────────────
+        // Draw tracker columns
         if ( file.trackerEnabled && file.segmentActive )
         {
             // Y anchor — place below the speedometer (or at baseY if speedometer is off)
@@ -214,10 +219,7 @@ void function SpeedTrackerThread()
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
 //  Column helpers
-// ═══════════════════════════════════════════════════════════════════
-
 TrackerColumn function GetColumn( int index )
 {
     switch ( index )
@@ -307,9 +309,7 @@ void function HideAll()
     HideTrackerColumns()
 }
 
-// ═══════════════════════════════════════════════════════════════════
 //  RUI factory
-// ═══════════════════════════════════════════════════════════════════
 var function CreateTextRUI( float fontSize )
 {
     var rui = RuiCreate(
@@ -328,9 +328,7 @@ var function CreateTextRUI( float fontSize )
     return rui
 }
 
-// ═══════════════════════════════════════════════════════════════════
 //  Settings
-// ═══════════════════════════════════════════════════════════════════
 void function UpdateSettings()
 {
     file.speedEnabled       = GetConVarBool( "speed_enable" )
@@ -347,6 +345,7 @@ void function UpdateSettings()
     file.historyCount       = clamp_i( GetConVarInt( "st_history_count" ), 0, 10 )
     file.idleTimeout        = max_c( 0.1, GetConVarFloat( "st_idle_timeout" ) )
     file.columnSpacing      = GetConVarFloat( "st_column_spacing" )
+    file.resetThreshold     = max_c( 1.0, GetConVarFloat( "st_reset_threshold" ) )
 
     // Layout presets
     int preset = GetConVarInt( "hud_layout_preset" )
@@ -366,9 +365,7 @@ void function UpdateSettings()
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
 //  Utility: parse a "X Y Z" convar into a vector
-// ─────────────────────────────────────────────────────────────────
 vector function GetConVarFloat3( string convar )
 {
     array<string> value = split( GetConVarString( convar ), " " )
